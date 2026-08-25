@@ -102,7 +102,14 @@ function detectHeadlineBlocks(page) {
     candidates.push({
       headline: block.lines.map(l => l.text).join(' '),
       teaser: bodyText.slice(0, 220),
-      body: bodyText.slice(0, 900),
+      // No arbitrary character cap here (an earlier version truncated this
+      // to 900 chars, which is what was actually behind "the pullout never
+      // shows the complete story" — not a display bug at all). The real,
+      // sensible limit is MAX_BODY_LINES_PER_CANDIDATE above, which already
+      // bounds how much text gets absorbed based on actual page layout —
+      // re-truncating that by raw character count on top was redundant and
+      // just cut articles off arbitrarily mid-sentence.
+      body: bodyText,
       box,
       detectionConfidence: clamp(round2((block.height / medianLineHeight - 1) / (HEADLINE_SIZE_RATIO)), 0, 1)
     });
