@@ -16,10 +16,18 @@ function authHeaders(extra = {}) {
  * relating documents to each other. See: https://docs.strapi.io/cms/api/rest
  */
 
-/** Fetch an Edition document by its documentId, populated with sourcePdf. */
+/**
+ * Fetch an Edition document by its documentId, populated with sourcePdf.
+ * `status=draft` is required here — the whole point of the ingest pipeline
+ * is to run against an Edition BEFORE an editor has published it (that's
+ * step 5 of the workflow, after reviewing the auto-detected stories), so
+ * this is, by design, almost always still a draft document when ingest
+ * reads it. Strapi 5's REST API only returns published entries by default;
+ * without this param, a perfectly real draft Edition 404s.
+ */
 export async function getEdition(editionDocumentId) {
   const res = await fetch(
-    `${STRAPI_URL}/api/editions/${editionDocumentId}?populate=sourcePdf`,
+    `${STRAPI_URL}/api/editions/${editionDocumentId}?populate=sourcePdf&status=draft`,
     { headers: authHeaders() }
   );
   if (!res.ok) throw new Error(`getEdition ${editionDocumentId} failed: ${res.status} ${await res.text()}`);
