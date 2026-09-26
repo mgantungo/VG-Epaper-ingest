@@ -66,20 +66,41 @@ export async function runIngest(editionDocumentId) {
         // Skip near-empty/low-signal detections rather than cluttering the
         // review queue — tune this threshold against your real layouts.
         if (!c.headline || c.headline.trim().length < 4) continue;
-        await createDraftStory({
-          pageDocumentId: page.documentId,
-          editionSku,
-          box: c.box,
-          kicker: c.kicker,
-          headline: c.headline.trim(),
-          byline: c.byline,
-          teaser: c.teaser,
-          body: c.body,
-          detectionConfidence: c.detectionConfidence,
-          continuesToPage: c.continuesToPage,
-          continuesFromPage: c.continuesFromPage
-        });
-        createdStoryCount += 1;
+
+        // Defensive truncation, not a substitute for fixing extraction
+        // quality — Strapi's default string type caps at 255 characters,
+        // and a genuinely garbled/merged headline can exceed that (seen
+        // directly: a scrambled multi-column merge produced a 500+ char
+        // "headline" that made Strapi reject the whole create call).
+        // Truncating means a bad detection still lands as a reviewable
+        // draft instead of being lost to a crash.
+        const headline = c.headline.trim().slice(0, 252) + (c.headline.trim().length > 252 ? '…' : '');
+
+        try {
+          await createDraftStory({
+            pageDocumentId: page.documentId,
+            editionSku,
+            box: c.box,
+            kicker: c.kicker,
+            headline,
+            byline: c.byline,
+            teaser: c.teaser,
+            body: c.body,
+            detectionConfidence: c.detectionConfidence,
+            continuesToPage: c.continuesToPage,
+            continuesFromPage: c.continuesFromPage
+          });
+          createdStoryCount += 1;
+        } catch (err) {
+          // ONE bad candidate must never abort the whole edition's ingest
+          // — confirmed directly: a single 400 from Strapi (headline too
+          // long) was propagating all the way up through this loop,
+          // aborting the run after only 3 of 36+ pages. Log it and move
+          // on to the next candidate; the editor reviewing drafts will
+          // simply see one fewer hotspot on that page, not a failed
+          // edition.
+          console.error(`[runIngest] failed to create story on page ${pageNumber} ("${headline.slice(0, 60)}..."):`, err.message);
+        }
       }
     }
 

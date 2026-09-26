@@ -364,9 +364,28 @@ function isCaptionBlock(block, images) {
 }
 
 // ---- per-page analysis ------------------------------------------------
+const SIDEBAR_MAX_WIDTH_RATIO = 0.6; // a detected box wider than this fraction of the page is treated as a headline's background styling, not a separate sidebar — see the comment below for why this distinction is necessary
+
 function analyzePage(page, regions, isCover) {
-  const { boxes, images } = regions;
-  const lines = groupWordsIntoLines(page.words, boxes);
+  // Not every detected filled/bordered rectangle is a genuine sidebar.
+  // Confirmed directly on a real page: a main headline sitting on a
+  // tinted background banner (common design treatment for emphasis) was
+  // ALSO detected as a "box" by the same rect-detection that correctly
+  // finds actual sidebars — and treating it identically (pulled out,
+  // processed separately, appended to the very END of the reading order)
+  // meant the real headline ended up read dead last on the page, while
+  // unrelated body content further down got mistaken for the start of a
+  // new story. The distinguishing signal is width: every genuine sidebar
+  // seen in testing was comfortably narrow (roughly one column's worth);
+  // a headline banner spans most of the page. Only narrow boxes are kept
+  // as real sidebar regions — a wide one is discarded here, so its words
+  // fall through to normal region: null flow and get read in their
+  // correct page position, same as any other line (including being
+  // correctly recognized as a wide/banner headline there, which is what
+  // should happen).
+  const sidebarBoxes = (regions.boxes || []).filter(b => (b.x1 - b.x0) <= page.width * SIDEBAR_MAX_WIDTH_RATIO);
+  const { images } = regions;
+  const lines = groupWordsIntoLines(page.words, sidebarBoxes);
   const section = detectSectionHeader(lines, isCover);
 
   const bodyLines = lines.filter(l => l.y1 > HEADER_BAND_PT);
