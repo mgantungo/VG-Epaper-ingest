@@ -18,10 +18,18 @@ function pad2(n) { return String(n).padStart(2, '0'); }
  * `documentId` (a string) — never the legacy numeric `id`:
  *   1. pull the sourcePdf Strapi is holding
  *   2. rasterize every page to an image (pdftoppm)
- *   3. detect candidate story sections per page from text layout (pdftotext -bbox)
- *   4. upload page images + create Page documents
- *   5. create the detected sections as *draft* Story documents for review
+ *   3. extract layout-aware sections/stories from the PDF's real text
+ *      layer (pdftotext -bbox + pdfplumber box/image detection) — see
+ *      extractSections.js for the actual algorithm, validated directly
+ *      against real New Vision issues, not just written to theory
+ *   4. upload page images + create Page documents, each tagged with its
+ *      detected section and the parent edition's SKU
+ *   5. create the detected stories as *draft* Story documents for review,
+ *      each also tagged with the edition SKU and any jump-line-derived
+ *      cross-page continuation links
  *   6. flip the Edition to ready_for_review (or failed, with the error recorded)
+ *
+ * Scope is native-text PDFs only — no OCR/scanned-PDF path, no .indd.
  */
 export async function runIngest(editionDocumentId) {
   const runDir = path.join(WORK_DIR, `edition-${editionDocumentId}-${Date.now()}`);
@@ -30,6 +38,7 @@ export async function runIngest(editionDocumentId) {
   try {
     const edition = await getEdition(editionDocumentId);
     const dateLabel = edition.date; // flattened response — no .attributes wrapper in Strapi 5
+    const editionSku = edition.sku; // auto-generated on the Edition itself — see its own lifecycles.js
 
     const pdfPath = path.join(runDir, 'source.pdf');
     await downloadSourcePdf(edition, pdfPath);
@@ -37,8 +46,8 @@ export async function runIngest(editionDocumentId) {
     const imagesDir = path.join(runDir, 'images');
     const imagePaths = await convertPdfToImages(pdfPath, imagesDir, { dpi: DPI, format: FORMAT });
 
-    const sectionsByPage = await extractSections(pdfPath, runDir);
-    const sectionsIndex = new Map(sectionsByPage.map(p => [p.pageNumber, p.candidates]));
+    const pages = await extractSections(pdfPath, runDir);
+    const pagesByNumber = new Map(pages.map(p => [p.pageNumber, p]));
 
     let createdStoryCount = 0;
     for (let i = 0; i < imagePaths.length; i++) {
@@ -46,21 +55,29 @@ export async function runIngest(editionDocumentId) {
       const ext = FORMAT === 'png' ? 'png' : 'jpg';
       const fileName = `edition-${dateLabel}-pg-${pad2(pageNumber)}.${ext}`;
 
-      const imageId = await uploadImage(imagePaths[i], fileName);
-      const page = await createPage({ editionDocumentId, pageNumber, section: null, imageId });
+      const pageResult = pagesByNumber.get(pageNumber);
+      const section = pageResult?.section || null;
 
-      const candidates = sectionsIndex.get(pageNumber) || [];
+      const imageId = await uploadImage(imagePaths[i], fileName);
+      const page = await createPage({ editionDocumentId, editionSku, pageNumber, section, imageId });
+
+      const candidates = pageResult?.candidates || [];
       for (const c of candidates) {
         // Skip near-empty/low-signal detections rather than cluttering the
         // review queue — tune this threshold against your real layouts.
         if (!c.headline || c.headline.trim().length < 4) continue;
         await createDraftStory({
           pageDocumentId: page.documentId,
+          editionSku,
           box: c.box,
+          kicker: c.kicker,
           headline: c.headline.trim(),
+          byline: c.byline,
           teaser: c.teaser,
           body: c.body,
-          detectionConfidence: c.detectionConfidence
+          detectionConfidence: c.detectionConfidence,
+          continuesToPage: c.continuesToPage,
+          continuesFromPage: c.continuesFromPage
         });
         createdStoryCount += 1;
       }

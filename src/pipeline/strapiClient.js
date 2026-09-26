@@ -24,6 +24,12 @@ function authHeaders(extra = {}) {
  * this is, by design, almost always still a draft document when ingest
  * reads it. Strapi 5's REST API only returns published entries by default;
  * without this param, a perfectly real draft Edition 404s.
+ *
+ * The returned object includes `sku` (auto-generated on the Edition itself
+ * at creation — see apps/cms/src/api/edition/content-types/edition/
+ * lifecycles.js) — runIngest.js reads it and passes it down to every Page
+ * and Story this run creates, denormalized, so each can be identified
+ * without traversing the edition relation.
  */
 export async function getEdition(editionDocumentId) {
   const res = await fetch(
@@ -32,7 +38,7 @@ export async function getEdition(editionDocumentId) {
   );
   if (!res.ok) throw new Error(`getEdition ${editionDocumentId} failed: ${res.status} ${await res.text()}`);
   const json = await res.json();
-  return json.data; // flattened — e.g. json.data.date, json.data.sourcePdf.url
+  return json.data; // flattened — e.g. json.data.date, json.data.sku, json.data.sourcePdf.url
 }
 
 /** Download the edition's source PDF to a local path. */
@@ -69,13 +75,19 @@ export async function uploadImage(filePath, fileName) {
   return uploaded.id;
 }
 
-/** Create a Page document linking a page image to an edition (by documentId). */
-export async function createPage({ editionDocumentId, pageNumber, section, imageId }) {
+/**
+ * Create a Page document linking a page image to an edition (by documentId).
+ * `section` must be one of Page.section's enum values (see its schema) or
+ * null — extractSections() already only returns a value when it confidently
+ * matched the canonical list, so this is a direct pass-through, not a
+ * separate validation step.
+ */
+export async function createPage({ editionDocumentId, editionSku, pageNumber, section, imageId }) {
   const res = await fetch(`${STRAPI_URL}/api/pages`, {
     method: 'POST',
     headers: authHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({
-      data: { edition: editionDocumentId, pageNumber, section, image: imageId }
+      data: { edition: editionDocumentId, editionSku, pageNumber, section, image: imageId }
     })
   });
   if (!res.ok) throw new Error(`createPage ${pageNumber} failed: ${res.status} ${await res.text()}`);
@@ -83,23 +95,37 @@ export async function createPage({ editionDocumentId, pageNumber, section, image
   return json.data; // { documentId, pageNumber, ... }
 }
 
-/** Create a draft Story hotspot on a page (auto-detected — needs editor review before publish). */
-export async function createDraftStory({ pageDocumentId, box, headline, teaser, body, detectionConfidence }) {
+/**
+ * Create a draft Story hotspot on a page (auto-detected — needs editor
+ * review before publish). continuesToPage/continuesFromPage are only ever
+ * set when extractSections() found an explicit jump-line marker in the
+ * text ("Turned to Page N" / "Continued from Page N") — see that module's
+ * own comments for why an absent marker is left null rather than guessed.
+ */
+export async function createDraftStory({
+  pageDocumentId, editionSku, box, kicker, headline, byline, teaser, body,
+  detectionConfidence, continuesToPage, continuesFromPage
+}) {
   const res = await fetch(`${STRAPI_URL}/api/stories?status=draft`, {
     method: 'POST',
     headers: authHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({
       data: {
         page: pageDocumentId,
+        editionSku,
         top: box.top,
         left: box.left,
         width: box.width,
         height: box.height,
+        kicker,
         headline,
+        byline,
         teaser,
         body,
         source: 'auto_detected',
-        detectionConfidence
+        detectionConfidence,
+        continuesToPage,
+        continuesFromPage
       }
     })
   });
@@ -107,8 +133,7 @@ export async function createDraftStory({ pageDocumentId, box, headline, teaser, 
   return (await res.json()).data;
 }
 
-/**
- * Update the edition's pipeline status (and pageCount / error message as
+/** Update the edition's pipeline status (and pageCount / error message as
  * relevant).
  *
  * `?status=draft` here is NOT optional — it's the actual fix for
@@ -120,11 +145,7 @@ export async function createDraftStory({ pageDocumentId, box, headline, teaser, 
  * Without this param, this PUT was silently creating/updating a PUBLISHED
  * copy of the edition that no one was looking at, while the actual DRAFT —
  * the one an editor sees in Strapi admin while reviewing auto-detected
- * stories, per the documented publish workflow (set pipelineStatus, Save,
- * THEN click Strapi's own Publish button) — was left completely untouched:
- * still blank pageCount, still whatever pipelineStatus it had before ingest
- * ran. From the only vantage point that matters (the admin UI), it looked
- * like this function was doing nothing at all.
+ * stories — was left completely untouched.
  */
 export async function updateEditionStatus(editionDocumentId, data) {
   const res = await fetch(`${STRAPI_URL}/api/editions/${editionDocumentId}?status=draft`, {
