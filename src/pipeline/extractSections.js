@@ -78,7 +78,27 @@ export async function extractSections(pdfPath, workDir) {
     });
 
     const isCover = page.pageNumber === 1; // covers carry no section name — confirmed on real front pages
-    results.push(analyzePage(page, regions, isCover));
+
+    // Same resilience principle as runIngest.js's per-page/per-story
+    // wrapping, applied one level earlier: analyzePage() runs the whole
+    // line-grouping/column-detection/candidate-building pipeline for one
+    // page, and this whole extractSections() call covers every page in
+    // one pass, BEFORE runIngest.js's own per-page loop (and its
+    // resilience) ever starts. Without this, a layout this hasn't been
+    // tested against — a page with no body lines, an unusual box
+    // configuration, anything triggering an edge case none of the ~4
+    // pages validated so far happened to hit — would abort extraction for
+    // the ENTIRE edition, and none of runIngest.js's per-page protection
+    // would get a chance to help, since it never even reaches that loop.
+    // Degrading to an empty result for just that one page (no section, no
+    // candidates — the page image itself still gets uploaded normally)
+    // is far better than losing every other page in the issue over it.
+    try {
+      results.push(analyzePage(page, regions, isCover));
+    } catch (err) {
+      console.error(`[extractSections] analysis failed for page ${page.pageNumber}, continuing with no detected stories for it:`, err.message);
+      results.push({ pageNumber: page.pageNumber, section: null, candidates: [] });
+    }
   }
   return results;
 }
