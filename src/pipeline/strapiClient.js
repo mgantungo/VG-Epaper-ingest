@@ -107,27 +107,9 @@ export async function createDraftStory({ pageDocumentId, box, headline, teaser, 
   return (await res.json()).data;
 }
 
-/**
- * Update the edition's pipeline status (and pageCount / error message as
- * relevant).
- *
- * `?status=draft` here is NOT optional — it's the actual fix for
- * "pageCount/pipelineStatus never seem to update after ingest." Strapi 5's
- * REST API defaults an update with NO status param to PUBLISH the document
- * immediately (this is documented Strapi 5 behavior, the opposite of what
- * you'd guess: "The Document Service API defaults to draft, but the REST
- * API defaults to published" — https://docs.strapi.io/cms/api/rest/status).
- * Without this param, this PUT was silently creating/updating a PUBLISHED
- * copy of the edition that no one was looking at, while the actual DRAFT —
- * the one an editor sees in Strapi admin while reviewing auto-detected
- * stories, per the documented publish workflow (set pipelineStatus, Save,
- * THEN click Strapi's own Publish button) — was left completely untouched:
- * still blank pageCount, still whatever pipelineStatus it had before ingest
- * ran. From the only vantage point that matters (the admin UI), it looked
- * like this function was doing nothing at all.
- */
+/** Update the edition's pipeline status (and pageCount / error message as relevant). */
 export async function updateEditionStatus(editionDocumentId, data) {
-  const res = await fetch(`${STRAPI_URL}/api/editions/${editionDocumentId}?status=draft`, {
+  const res = await fetch(`${STRAPI_URL}/api/editions/${editionDocumentId}`, {
     method: 'PUT',
     headers: authHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({ data })
