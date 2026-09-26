@@ -41,6 +41,34 @@ export async function getEdition(editionDocumentId) {
   return json.data; // flattened — e.g. json.data.date, json.data.sku, json.data.sourcePdf.url
 }
 
+/**
+ * Known section names for ONE publication (api::publication-section,
+ * scoped by publicationCode) — passed to extractSections() so its section
+ * detection can recognize this specific paper's own vocabulary, not a
+ * single list shared across every publication on the platform. Returns
+ * [] (not a throw) if the fetch fails or nothing is registered yet —
+ * extractSections() already handles an empty/missing known-sections list
+ * gracefully, falling back to whatever text it actually detects rather
+ * than requiring a match.
+ */
+export async function getPublicationSections(publicationCode) {
+  try {
+    const res = await fetch(
+      `${STRAPI_URL}/api/publication-sections?filters[publicationCode][$eq]=${encodeURIComponent(publicationCode)}&sort=sortOrder:asc&pagination[pageSize]=200`,
+      { headers: authHeaders() }
+    );
+    if (!res.ok) {
+      console.warn(`[strapiClient] getPublicationSections(${publicationCode}) failed: ${res.status} — falling back to extractSections()'s own default list`);
+      return [];
+    }
+    const json = await res.json();
+    return (json.data || []).map(s => s.name).filter(Boolean);
+  } catch (err) {
+    console.warn(`[strapiClient] getPublicationSections(${publicationCode}) could not reach Strapi — falling back to extractSections()'s own default list:`, err.message);
+    return [];
+  }
+}
+
 /** Download the edition's source PDF to a local path. */
 export async function downloadSourcePdf(edition, destPath) {
   const pdfUrl = edition.sourcePdf?.url;

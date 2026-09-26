@@ -2,10 +2,10 @@ import 'dotenv/config';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
-  getEdition, downloadSourcePdf, uploadImage, createPage, createDraftStory, updateEditionStatus
+  getEdition, getPublicationSections, downloadSourcePdf, uploadImage, createPage, createDraftStory, updateEditionStatus
 } from './strapiClient.js';
 import { convertPdfToImages } from './convertPdfToImages.js';
-import { extractSections } from './extractSections.js';
+import { extractSections, DEFAULT_PUBLICATION_SECTIONS } from './extractSections.js';
 
 const WORK_DIR = process.env.WORK_DIR || '/tmp/newvision-ingest';
 const DPI = Number(process.env.PAGE_IMAGE_DPI || 150);
@@ -46,7 +46,21 @@ export async function runIngest(editionDocumentId) {
     const imagesDir = path.join(runDir, 'images');
     const imagePaths = await convertPdfToImages(pdfPath, imagesDir, { dpi: DPI, format: FORMAT });
 
-    const pages = await extractSections(pdfPath, runDir);
+    // Per-publication section vocabulary, not one global list — see
+    // extractSections.js's detectSectionHeader() for why. Falls back to
+    // the original New Vision list only when nothing's registered yet for
+    // this publicationCode (a brand new, likely still-empty collection) —
+    // getPublicationSections([]) would otherwise EXPLICITLY pass an empty
+    // array through, which is not the same as omitting the argument:
+    // extractSections()'s own default parameter only applies to
+    // undefined, so an empty list here would silently disable even New
+    // Vision's own clean matching until someone populates the new
+    // publication-section collection through Strapi admin.
+    const publicationCode = edition.publicationCode || 'NV';
+    const fetchedSections = await getPublicationSections(publicationCode);
+    const knownSections = fetchedSections.length ? fetchedSections : DEFAULT_PUBLICATION_SECTIONS;
+
+    const pages = await extractSections(pdfPath, runDir, knownSections);
     const pagesByNumber = new Map(pages.map(p => [p.pageNumber, p]));
 
     let createdStoryCount = 0;

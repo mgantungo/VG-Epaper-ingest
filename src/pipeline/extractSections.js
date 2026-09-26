@@ -19,12 +19,15 @@ const execFileAsync = promisify(execFile);
  * candidates are before a human ever looks at them.
  */
 
-// Mirrors Page.section's Strapi enumeration exactly — keep these two lists
-// in sync. Matching is done by checking whether one of these appears
-// (case-insensitively, whitespace-normalized) inside the page's top-band
-// text, not by requiring an exact match — the band also contains the "NV"
-// masthead mark and the page number as noise around the real section name.
-export const PUBLICATION_SECTIONS = [
+// Used as a FALLBACK only, when the caller doesn't supply a per-publication
+// known-sections list (see extractSections()'s knownSections parameter
+// below) — e.g. New Vision's own list, if runIngest.js's fetch from
+// api::publication-section fails for some reason. NOT the source of
+// truth: a global fixed list was tried first and rejected specifically
+// because it silently dropped any section name belonging to a different
+// publication than this one. detectSectionHeader() falls back to the
+// actual detected text when nothing here matches, rather than null.
+export const DEFAULT_PUBLICATION_SECTIONS = [
   'Adverts', 'Beat', 'Business', 'Business Vision', 'CSI', 'Case Files', 'Classified',
   'Comments', 'Community News', 'Court', 'Crocs', 'Election News', 'Feature', 'Green UG',
   'Harvest Money', 'Health', 'Her Vision', 'Homes', 'International News', 'JobMart',
@@ -59,7 +62,7 @@ const MAX_BODY_LINES_PER_CANDIDATE = 14;
 const HEADER_BAND_PT = 90;         // top-of-page strip searched for the section name — see detectSectionHeader()
 const MIN_COLUMN_LINE_COUNT = 5;   // an x0 cluster needs at least this many lines to count as a real column, not stray indentation
 
-export async function extractSections(pdfPath, workDir) {
+export async function extractSections(pdfPath, workDir, knownSections = DEFAULT_PUBLICATION_SECTIONS) {
   const bboxPath = `${workDir}/layout.xml`;
   await execFileAsync('pdftotext', ['-bbox', pdfPath, bboxPath]);
   const xml = await fs.promises.readFile(bboxPath, 'utf8');
@@ -94,7 +97,7 @@ export async function extractSections(pdfPath, workDir) {
     // candidates — the page image itself still gets uploaded normally)
     // is far better than losing every other page in the issue over it.
     try {
-      results.push(analyzePage(page, regions, isCover));
+      results.push(analyzePage(page, regions, isCover, knownSections));
     } catch (err) {
       console.error(`[extractSections] analysis failed for page ${page.pageNumber}, continuing with no detected stories for it:`, err.message);
       results.push({ pageNumber: page.pageNumber, section: null, candidates: [] });
@@ -145,7 +148,7 @@ function parseBboxXmlIntoPages(xml) {
     wordRe.lastIndex = 0;
     while ((wordMatch = wordRe.exec(body))) {
       const [, x0, y0, x1, y1, text] = wordMatch;
-      const decoded = text.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
+      const decoded = text.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#39;/g, "'");
       if (!decoded.trim()) continue;
       words.push({
         x0: parseFloat(x0), y0: parseFloat(y0), x1: parseFloat(x1), y1: parseFloat(y1),
@@ -225,29 +228,59 @@ function groupWordsIntoLines(words, boxes) {
 // these is left with section: null for an editor to set, rather than
 // inventing a value. Covers (page 1) are never checked — confirmed on real
 // front pages to carry no section name at all.
-function detectSectionHeader(lines, isCover) {
+// Matched against this publication's own known sections when possible
+// (api::publication-section, scoped by publicationCode — see runIngest.js),
+// but NOT constrained to that list. A fixed global enum was tried first
+// and rejected: it silently dropped any section name belonging to a
+// different publication than the one that list was built for. When
+// nothing in knownSections matches confidently, this falls back to
+// whatever text was actually detected in the header band — cleaned of the
+// parts reliably known NOT to be the section name (the date line, the
+// page number, the "NV" masthead mark) — rather than returning null and
+// losing it.
+function detectSectionHeader(lines, isCover, knownSections) {
   if (isCover) return null;
-  const bandText = lines
-    .filter(l => l.y1 <= HEADER_BAND_PT)
-    .map(l => l.text)
-    .join(' ')
-    .toUpperCase()
-    .replace(/\s+/g, ' ');
-  if (!bandText) return null;
+  const bandLines = lines.filter(l => l.y1 <= HEADER_BAND_PT);
+  if (!bandLines.length) return null;
+
+  const bandText = bandLines.map(l => l.text).join(' ').toUpperCase().replace(/\s+/g, ' ');
 
   // Longest match wins — e.g. "Business Vision" should win over a
   // coincidental partial match of plain "Business" if both were ever
   // substrings of the same band text.
   let matchedSection = null;
   let matchedLength = 0;
-  for (const section of PUBLICATION_SECTIONS) {
-    const needle = section.toUpperCase();
+  for (const name of knownSections) {
+    const needle = name.toUpperCase();
     if (bandText.includes(needle) && needle.length > matchedLength) {
-      matchedSection = section;
+      matchedSection = name;
       matchedLength = needle.length;
     }
   }
-  return matchedSection;
+  if (matchedSection) return matchedSection;
+
+  // No confident match against the known list — fall back to the actual
+  // detected text instead of dropping it. A date line ("Friday, September
+  // 18, 2026") and a bare page number are the two reliably-identifiable
+  // non-section elements in this band; whatever's left, keep. Checking
+  // for a weekday name OR a bare 4-digit year separately, rather than
+  // requiring the whole line to match one exact date format, catches a
+  // date line even if it happens to wrap across two lines on some page's
+  // masthead layout (confirmed directly: a full-line date pattern missed
+  // a real date on one page, letting it fall through and get picked up as
+  // a "section"). A photo-credit line ("Photo by ...") is excluded the
+  // same way — also confirmed leaking through on a real page.
+  const NON_SECTION_LINE_RE = /^(mon|tue|wed|thu|fri|sat|sun)\w*,?$|\b(19|20)\d{2}\b|^photo\s*(by|:)/i;
+  const candidateLines = bandLines
+    .filter(l => !NON_SECTION_LINE_RE.test(l.text.trim()))
+    .filter(l => !/^\d+$/.test(l.text.trim()));
+  if (!candidateLines.length) return null;
+
+  // The section name is typically the most visually prominent remaining
+  // text in the band — taller than the date line or a stray page number.
+  const best = candidateLines.reduce((a, b) => (b.h > a.h ? b : a));
+  const cleaned = best.text.replace(/^\s*NV\s+/i, '').trim(); // strip a leading masthead "NV" mark merged onto the same line
+  return cleaned || null;
 }
 
 // ---- reading order: segment-then-column ------------------------------
@@ -386,7 +419,7 @@ function isCaptionBlock(block, images) {
 // ---- per-page analysis ------------------------------------------------
 const SIDEBAR_MAX_WIDTH_RATIO = 0.6; // a detected box wider than this fraction of the page is treated as a headline's background styling, not a separate sidebar — see the comment below for why this distinction is necessary
 
-function analyzePage(page, regions, isCover) {
+function analyzePage(page, regions, isCover, knownSections) {
   // Not every detected filled/bordered rectangle is a genuine sidebar.
   // Confirmed directly on a real page: a main headline sitting on a
   // tinted background banner (common design treatment for emphasis) was
@@ -406,7 +439,7 @@ function analyzePage(page, regions, isCover) {
   const sidebarBoxes = (regions.boxes || []).filter(b => (b.x1 - b.x0) <= page.width * SIDEBAR_MAX_WIDTH_RATIO);
   const { images } = regions;
   const lines = groupWordsIntoLines(page.words, sidebarBoxes);
-  const section = detectSectionHeader(lines, isCover);
+  const section = detectSectionHeader(lines, isCover, knownSections);
 
   const bodyLines = lines.filter(l => l.y1 > HEADER_BAND_PT);
 
