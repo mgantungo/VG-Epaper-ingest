@@ -2,7 +2,7 @@ import 'dotenv/config';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
-  getEdition, getPublicationSections, downloadSourcePdf, uploadImage, createPage, createDraftStory, updateEditionStatus
+  getEdition, getPublicationSections, downloadSourcePdf, uploadImage, createPage, createStory, updateEditionStatus
 } from './strapiClient.js';
 import { convertPdfToImages } from './convertPdfToImages.js';
 import { extractSections, DEFAULT_PUBLICATION_SECTIONS } from './extractSections.js';
@@ -87,12 +87,15 @@ export async function runIngest(editionDocumentId) {
           // and a genuinely garbled/merged headline can exceed that (seen
           // directly: a scrambled multi-column merge produced a 500+ char
           // "headline" that made Strapi reject the whole create call).
-          // Truncating means a bad detection still lands as a reviewable
-          // draft instead of being lost to a crash.
+          // Truncating means a bad detection still lands as a visible (if
+          // imperfect) entry instead of being lost to a crash — worth
+          // noting given entries now publish immediately (see
+          // strapiClient.js's createStory), there's no draft review step
+          // left to catch a truncated headline before a reader sees it.
           const headline = c.headline.trim().slice(0, 252) + (c.headline.trim().length > 252 ? '…' : '');
 
           try {
-            await createDraftStory({
+            await createStory({
               pageDocumentId: page.documentId,
               editionSku,
               box: c.box,
@@ -111,9 +114,8 @@ export async function runIngest(editionDocumentId) {
             // — confirmed directly: a single 400 from Strapi (headline too
             // long) was propagating all the way up through this loop,
             // aborting the run after only 3 of 36+ pages. Log it and move
-            // on to the next candidate; the editor reviewing drafts will
-            // simply see one fewer hotspot on that page, not a failed
-            // edition.
+            // on to the next candidate — that page simply ends up with one
+            // fewer published hotspot, not a failed edition.
             console.error(`[runIngest] failed to create story on page ${pageNumber} ("${headline.slice(0, 60)}..."):`, err.message);
           }
         }

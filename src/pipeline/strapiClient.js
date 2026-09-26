@@ -130,11 +130,25 @@ export async function createPage({ editionDocumentId, editionSku, pageNumber, se
  * text ("Turned to Page N" / "Continued from Page N") — see that module's
  * own comments for why an absent marker is left null rather than guessed.
  */
-export async function createDraftStory({
+/**
+ * Create a Story hotspot on a page, published immediately — NOT created
+ * as a draft awaiting editor review. This is a deliberate reversal of this
+ * pipeline's original design (every detection reviewed before going live);
+ * see the request that changed it if the tradeoff ever needs revisiting —
+ * auto-detection's known limitations (occasional garbled/truncated
+ * headlines even after defensive truncation, ad content sometimes
+ * misdetected as a story, pull-quote text sometimes dropped) now reach
+ * readers immediately, with nothing catching them first.
+ * continuesToPage/continuesFromPage are only ever set when
+ * extractSections() found an explicit jump-line marker in the text
+ * ("Turned to Page N" / "Continued from Page N") — see that module's own
+ * comments for why an absent marker is left null rather than guessed.
+ */
+export async function createStory({
   pageDocumentId, editionSku, box, kicker, headline, byline, teaser, body,
   detectionConfidence, continuesToPage, continuesFromPage
 }) {
-  const res = await fetch(`${STRAPI_URL}/api/stories?status=draft`, {
+  const res = await fetch(`${STRAPI_URL}/api/stories?status=published`, {
     method: 'POST',
     headers: authHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({
@@ -157,7 +171,7 @@ export async function createDraftStory({
       }
     })
   });
-  if (!res.ok) throw new Error(`createDraftStory failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`createStory failed: ${res.status} ${await res.text()}`);
   return (await res.json()).data;
 }
 
