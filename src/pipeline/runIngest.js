@@ -2,7 +2,7 @@ import 'dotenv/config';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
-  getEdition, getPublicationSections, downloadSourcePdf, uploadImage, createPage, createStory, updateEditionStatus
+  getEdition, getPublicationSections, getSkipExtractionSections, downloadSourcePdf, uploadImage, createPage, createStory, updateEditionStatus
 } from './strapiClient.js';
 import { convertPdfToImages } from './convertPdfToImages.js';
 import { extractSections, DEFAULT_PUBLICATION_SECTIONS } from './extractSections.js';
@@ -59,8 +59,9 @@ export async function runIngest(editionDocumentId) {
     const publicationCode = edition.publicationCode || 'NV';
     const fetchedSections = await getPublicationSections(publicationCode);
     const knownSections = fetchedSections.length ? fetchedSections : DEFAULT_PUBLICATION_SECTIONS;
+    const skipExtractionSections = await getSkipExtractionSections(publicationCode);
 
-    const pages = await extractSections(pdfPath, runDir, knownSections);
+    const pages = await extractSections(pdfPath, runDir, knownSections, skipExtractionSections);
     const pagesByNumber = new Map(pages.map(p => [p.pageNumber, p]));
 
     let createdStoryCount = 0;

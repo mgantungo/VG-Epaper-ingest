@@ -70,7 +70,7 @@ const MAX_BODY_LINES_PER_CANDIDATE = 80;
 const HEADER_BAND_PT = 90;         // top-of-page strip searched for the section name — see detectSectionHeader()
 const MIN_COLUMN_LINE_COUNT = 5;   // an x0 cluster needs at least this many lines to count as a real column, not stray indentation
 
-export async function extractSections(pdfPath, workDir, knownSections = DEFAULT_PUBLICATION_SECTIONS) {
+export async function extractSections(pdfPath, workDir, knownSections = DEFAULT_PUBLICATION_SECTIONS, skipExtractionSections = new Set()) {
   const bboxPath = `${workDir}/layout.xml`;
   await execFileAsync('pdftotext', ['-bbox', pdfPath, bboxPath]);
   const xml = await fs.promises.readFile(bboxPath, 'utf8');
@@ -105,13 +105,44 @@ export async function extractSections(pdfPath, workDir, knownSections = DEFAULT_
     // candidates — the page image itself still gets uploaded normally)
     // is far better than losing every other page in the issue over it.
     try {
-      results.push(analyzePage(page, regions, isCover, knownSections));
+      results.push(analyzePage(page, regions, isCover, knownSections, skipExtractionSections));
     } catch (err) {
       console.error(`[extractSections] analysis failed for page ${page.pageNumber}, continuing with no detected stories for it:`, err.message);
       results.push({ pageNumber: page.pageNumber, section: null, candidates: [] });
     }
   }
   return results;
+}
+
+/**
+ * Debug-only entry point for one page — returns everything
+ * extractSections() computes for that page (section, candidates) PLUS the
+ * intermediate detail (every line with its region/column assignment,
+ * every block, the raw detected box/image regions) that the production
+ * path discards after building candidates. Never called from runIngest.js
+ * — this exists for the visualization tool (scripts/visualize_extraction.py)
+ * and any other debugging, so a mismatch between what the algorithm
+ * actually saw and what it produced can be inspected directly rather than
+ * reconstructed by reading console output.
+ */
+export async function analyzePageForVisualization(pdfPath, pageNumber, knownSections = DEFAULT_PUBLICATION_SECTIONS) {
+  const bboxPath = `/tmp/visualize-bbox-${Date.now()}.xml`;
+  await execFileAsync('pdftotext', ['-bbox', '-f', String(pageNumber), '-l', String(pageNumber), pdfPath, bboxPath]);
+  const xml = await fs.promises.readFile(bboxPath, 'utf8');
+  await fs.promises.unlink(bboxPath).catch(() => {});
+  const pages = parseBboxXmlIntoPages(xml);
+  const page = pages[0];
+  if (!page) throw new Error(`No page ${pageNumber} found`);
+  page.pageNumber = pageNumber; // parseBboxXmlIntoPages numbers sequentially from 1 within whatever range it parsed — restore the real page number since we only parsed a single-page slice
+
+  const regions = await detectRegions(pdfPath, pageNumber).catch(err => {
+    console.warn(`[analyzePageForVisualization] box/image detection failed:`, err.message);
+    return { boxes: [], images: [] };
+  });
+
+  const isCover = pageNumber === 1;
+  const result = analyzePage(page, regions, isCover, knownSections);
+  return { ...result, pageWidth: page.width, pageHeight: page.height, rawBoxes: regions.boxes || [], rawImages: regions.images || [] };
 }
 
 // Prefers a venv's own Python (apps/ingest/venv/), if one exists, over the
@@ -443,7 +474,7 @@ function isCaptionBlock(block, images) {
 // ---- per-page analysis ------------------------------------------------
 const SIDEBAR_MAX_WIDTH_RATIO = 0.6; // a detected box wider than this fraction of the page is treated as a headline's background styling, not a separate sidebar — see the comment below for why this distinction is necessary
 
-function analyzePage(page, regions, isCover, knownSections) {
+function analyzePage(page, regions, isCover, knownSections, skipExtractionSections) {
   // Not every detected filled/bordered rectangle is a genuine sidebar.
   // Confirmed directly on a real page: a main headline sitting on a
   // tinted background banner (common design treatment for emphasis) was
@@ -464,6 +495,20 @@ function analyzePage(page, regions, isCover, knownSections) {
   const { images } = regions;
   const lines = groupWordsIntoLines(page.words, sidebarBoxes);
   const section = detectSectionHeader(lines, isCover, knownSections);
+
+  // Some sections are structurally not editorial content — classified
+  // ads, advertorials, puzzle/leisure pages, exam result listings — and
+  // running the extraction heuristic on them produces garbled nonsense
+  // rather than a story, since there IS no story there to find. Checked
+  // by name (case-insensitive) against a caller-supplied set rather than
+  // hardcoded here, so it can grow over time through Strapi admin (see
+  // api::publication-section's skipStoryExtraction field) without a code
+  // change. Returning immediately, before any reading-order/column work,
+  // also means this costs nothing extra on a page that's going to be
+  // discarded anyway.
+  if (section && skipExtractionSections?.has(section.toLowerCase())) {
+    return { pageNumber: page.pageNumber, section, candidates: [], lines: [], blocks: [] };
+  }
 
   const bodyLines = lines.filter(l => l.y1 > HEADER_BAND_PT);
 
@@ -492,7 +537,13 @@ function analyzePage(page, regions, isCover, knownSections) {
 
   const candidates = buildStoryCandidates(blocks, medianHeight, images, page.width, page.height);
 
-  return { pageNumber: page.pageNumber, section, candidates };
+  // lines/blocks are extra, debug-only detail — the production caller in
+  // extractSections() only reads pageNumber/section/candidates from this,
+  // so returning more here doesn't change or slow down the real pipeline.
+  // A separate debug entry point (see analyzePageForVisualization below)
+  // uses this same detail to render what the algorithm actually saw,
+  // rather than requiring a human to reconstruct it from console output.
+  return { pageNumber: page.pageNumber, section, candidates, lines, blocks };
 }
 
 function buildStoryCandidates(blocks, medianHeight, images, pageWidth, pageHeight) {
@@ -593,7 +644,14 @@ function buildStoryCandidates(blocks, medianHeight, images, pageWidth, pageHeigh
       regions: computeRegions(allLines, pageWidth, pageHeight), // the actual heatmap — one rectangle per column occupied, see computeRegions()'s own comment for why a single box is wrong here
       detectionConfidence: clamp(round2((block.h / medianHeight - 1) / HEADLINE_SIZE_RATIO), 0, 1),
       continuesToPage: jumpLine?.direction === 'to' ? jumpLine.page : null,
-      continuesFromPage: jumpLine?.direction === 'from' ? jumpLine.page : null
+      continuesFromPage: jumpLine?.direction === 'from' ? jumpLine.page : null,
+      // Debug-only — runIngest.js/strapiClient.js never read these, so
+      // they ride along harmlessly in production. Exists so the
+      // visualization tool can know exactly which lines this specific
+      // candidate claimed, rather than reverse-engineering it from text
+      // matching after the fact (fragile — text can legitimately repeat).
+      _debugLines: allLines,
+      _debugFromBoxRegion: block.region !== null
     });
   }
   return candidates;

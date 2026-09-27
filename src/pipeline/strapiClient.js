@@ -69,6 +69,35 @@ export async function getPublicationSections(publicationCode) {
   }
 }
 
+/**
+ * Section names (lowercased, as a Set) for which story extraction should
+ * be skipped entirely — classified ads, advertorials, puzzle/leisure
+ * pages, exam result listings, anything structurally not editorial
+ * content. Growable over time through Strapi admin (flip
+ * skipStoryExtraction on a publication-section entry) rather than a code
+ * change. Returns an empty Set (not a throw) on any failure — a page
+ * simply gets normal extraction attempted rather than the whole run
+ * failing over a lookup that's meant to be a refinement, not a
+ * dependency.
+ */
+export async function getSkipExtractionSections(publicationCode) {
+  try {
+    const res = await fetch(
+      `${STRAPI_URL}/api/publication-sections?filters[publicationCode][$eq]=${encodeURIComponent(publicationCode)}&filters[skipStoryExtraction][$eq]=true&pagination[pageSize]=200`,
+      { headers: authHeaders() }
+    );
+    if (!res.ok) {
+      console.warn(`[strapiClient] getSkipExtractionSections(${publicationCode}) failed: ${res.status} — no sections will be skipped this run`);
+      return new Set();
+    }
+    const json = await res.json();
+    return new Set((json.data || []).map(s => (s.name || '').toLowerCase()).filter(Boolean));
+  } catch (err) {
+    console.warn(`[strapiClient] getSkipExtractionSections(${publicationCode}) could not reach Strapi — no sections will be skipped this run:`, err.message);
+    return new Set();
+  }
+}
+
 /** Download the edition's source PDF to a local path. */
 export async function downloadSourcePdf(edition, destPath) {
   const pdfUrl = edition.sourcePdf?.url;
