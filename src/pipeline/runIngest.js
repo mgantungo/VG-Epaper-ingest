@@ -99,6 +99,7 @@ export async function runIngest(editionDocumentId) {
               pageDocumentId: page.documentId,
               editionSku,
               box: c.box,
+              regions: c.regions,
               kicker: c.kicker,
               headline,
               byline: c.byline,

@@ -145,7 +145,7 @@ export async function createPage({ editionDocumentId, editionSku, pageNumber, se
  * comments for why an absent marker is left null rather than guessed.
  */
 export async function createStory({
-  pageDocumentId, editionSku, box, kicker, headline, byline, teaser, body,
+  pageDocumentId, editionSku, box, regions, kicker, headline, byline, teaser, body,
   detectionConfidence, continuesToPage, continuesFromPage
 }) {
   const res = await fetch(`${STRAPI_URL}/api/stories?status=published`, {
@@ -159,6 +159,7 @@ export async function createStory({
         left: box.left,
         width: box.width,
         height: box.height,
+        regions,
         kicker,
         headline,
         byline,

@@ -58,7 +58,15 @@ const LINE_OVERLAP_RATIO = 0.5;    // min vertical box-overlap (of the smaller w
 const LINE_X_GAP_RATIO = 1.6;      // max horizontal gap (relative to text height) before it's a new line, not continued word-spacing
 const PARAGRAPH_GAP_RATIO = 1.4;   // vertical gap bigger than this multiple of line height starts a new block
 const HEADLINE_SIZE_RATIO = 1.35;  // a block whose height is this many times the page's median body-line height counts as a headline
-const MAX_BODY_LINES_PER_CANDIDATE = 14;
+// Was 14 — genuinely too low for a complete story: a real multi-column
+// article can easily have 20-30+ short paragraph blocks once spread
+// across 3-4 narrow columns, and that cap was silently truncating longer
+// articles rather than capturing them completely. This is a safety net
+// against runaway absorption if the NEXT real headline is somehow never
+// detected — not meant to be the normal stopping point, which is finding
+// that next headline. Raised generously given "completeness over
+// ingestion speed" is the explicit priority, not a tight performance bound.
+const MAX_BODY_LINES_PER_CANDIDATE = 80;
 const HEADER_BAND_PT = 90;         // top-of-page strip searched for the section name — see detectSectionHeader()
 const MIN_COLUMN_LINE_COUNT = 5;   // an x0 cluster needs at least this many lines to count as a real column, not stray indentation
 
@@ -125,10 +133,26 @@ function resolvePythonCommand() {
   return process.platform === 'win32' ? 'python' : 'python3';
 }
 
-async function detectRegions(pdfPath, pageNumber) {
+// Retried up to 3 times — a subprocess call (spawning Python, opening the
+// PDF again for just this page) can fail transiently for reasons that
+// have nothing to do with the page's actual content (a momentary resource
+// pressure spike, a brief filesystem hiccup) — worth retrying given
+// completeness matters more than ingestion speed here, unlike the
+// deterministic text-layout algorithm itself, which would just fail the
+// same way every time on the same input and gains nothing from a retry.
+async function detectRegions(pdfPath, pageNumber, attempt = 1) {
   const scriptPath = new URL('../../scripts/detect_boxes.py', import.meta.url).pathname;
-  const { stdout } = await execFileAsync(resolvePythonCommand(), [scriptPath, pdfPath, String(pageNumber)]);
-  return JSON.parse(stdout);
+  try {
+    const { stdout } = await execFileAsync(resolvePythonCommand(), [scriptPath, pdfPath, String(pageNumber)]);
+    return JSON.parse(stdout);
+  } catch (err) {
+    if (attempt < 3) {
+      console.warn(`[extractSections] box/image detection attempt ${attempt} failed for page ${pageNumber}, retrying:`, err.message);
+      await new Promise(r => setTimeout(r, 300 * attempt)); // brief, increasing backoff
+      return detectRegions(pdfPath, pageNumber, attempt + 1);
+    }
+    throw err; // exhausted retries — caller's own .catch() degrades to boxes:[]/images:[]
+  }
 }
 
 // ---- pdftotext -bbox parsing --------------------------------------------
@@ -518,23 +542,25 @@ function buildStoryCandidates(blocks, medianHeight, images, pageWidth, pageHeigh
         // A large block here is either the NEXT story's real headline, or
         // a pull-quote (a styled excerpt repeated from this story's own
         // body — common design element, no background box the way the
-        // sidebar case had, so that earlier fix doesn't catch it).
-        // Confirmed directly: without this distinction, a pull quote
-        // partway through a story was treated as "next headline, stop
-        // here," truncating the real body to ~100 characters and spawning
-        // 3-4 junk fragment candidates from the quote's own differently-
-        // styled spans. A genuine headline always starts a fresh story at
-        // the TOP of the column flow; a pull-quote interrupts a flow
-        // that's already producing normal body text. So: before any real
-        // body content has been collected, treat a large block as the
-        // next headline and stop (unchanged behavior). Once body content
-        // IS flowing, skip a large block instead of stopping — treat it
-        // as decorative, not extracted as its own field, but don't let it
-        // truncate the real body either. This is a known incomplete area,
-        // not a full fix — the quote's own text is dropped rather than
-        // captured as e.g. a dedicated pullQuote field, and a genuine
-        // second headline sitting right after a very short first
-        // paragraph could in principle still be swallowed this way.
+        // sidebar case had, so that earlier box-region fix doesn't catch
+        // it). The reliable signal turned out to be width, not "has body
+        // content already started flowing" — confirmed directly both
+        // ways: a genuine next headline (real case: "PLU welcomes...")
+        // measured column === -1 (wide/banner, same classification real
+        // headlines get everywhere else in this file), while a real
+        // pull-quote fragment measured column === 0 (narrow, sitting
+        // within a single column like an inset callout). The earlier
+        // "sawBodyContent" check alone wasn't enough on its own — once
+        // completeness improvements let a story's body run long enough to
+        // actually reach a genuine next headline, that check treated the
+        // real headline as a skippable pull-quote too, silently merging
+        // two separate stories into one (confirmed directly: ISBAT's body
+        // swallowed the entirety of the next story on the same page).
+        // Width is checked first and wins regardless of sawBodyContent;
+        // the sawBodyContent fallback still guards the case where a
+        // narrow-but-large block appears before any body has flowed yet
+        // (treated as a genuine headline there too, unchanged from before).
+        if (next.column === -1) break;
         if (!sawBodyContent) break;
         consumed.add(j);
         j += 1;
@@ -563,7 +589,8 @@ function buildStoryCandidates(blocks, medianHeight, images, pageWidth, pageHeigh
       byline,
       teaser: bodyText.slice(0, 220),
       body: bodyText, // no arbitrary character cap — see extractSections history; the real bound is MAX_BODY_LINES_PER_CANDIDATE above
-      box: boundingBoxOf(allLines, pageWidth, pageHeight),
+      box: boundingBoxOf(allLines, pageWidth, pageHeight), // overall box — kept for any caller that just needs one rectangle
+      regions: computeRegions(allLines, pageWidth, pageHeight), // the actual heatmap — one rectangle per column occupied, see computeRegions()'s own comment for why a single box is wrong here
       detectionConfidence: clamp(round2((block.h / medianHeight - 1) / HEADLINE_SIZE_RATIO), 0, 1),
       continuesToPage: jumpLine?.direction === 'to' ? jumpLine.page : null,
       continuesFromPage: jumpLine?.direction === 'from' ? jumpLine.page : null
@@ -596,6 +623,52 @@ function boundingBoxOf(lines, pageWidth, pageHeight) {
     width: round2(((x1 - x0) / pageWidth) * 100),
     height: round2(((y1 - y0) / pageHeight) * 100)
   };
+}
+
+// A single top/left/width/height box is structurally wrong for a story
+// spanning multiple columns: it stretches from the leftmost occupied
+// column's left edge to the rightmost's right edge, at the FULL height
+// needed by whichever column is tallest — meaning it covers the gutters
+// between columns, AND any unrelated content sandwiched between them at
+// the same Y-range if the columns don't have matching line counts. This
+// computes the real heatmap instead: one rectangle per column the story
+// actually occupies (a headline's own wide "column" of -1 naturally gets
+// its own separate rectangle this same way, since it's grouped by the
+// same column id as everything else).
+//
+// Within one column, a story's lines are a single contiguous run in
+// practice — buildStoryCandidates() consumes blocks sequentially, so
+// nothing else can be interleaved into the middle of one story's own
+// portion of a column. A defensive Y-gap split is still applied in case
+// that assumption is ever wrong on some layout not yet seen: a gap much
+// larger than the lines' own height starts a new region rather than
+// silently stretching one rectangle across an unrelated gap.
+const REGION_SPLIT_GAP_RATIO = 4;
+
+function computeRegions(lines, pageWidth, pageHeight) {
+  const byColumn = new Map();
+  for (const line of lines) {
+    const key = line.column;
+    if (!byColumn.has(key)) byColumn.set(key, []);
+    byColumn.get(key).push(line);
+  }
+
+  const regions = [];
+  for (const colLines of byColumn.values()) {
+    colLines.sort((a, b) => a.y0 - b.y0);
+    let run = [];
+    for (const line of colLines) {
+      const last = run[run.length - 1];
+      const gap = last ? line.y0 - last.y1 : 0;
+      if (last && gap > last.h * REGION_SPLIT_GAP_RATIO) {
+        regions.push(boundingBoxOf(run, pageWidth, pageHeight));
+        run = [];
+      }
+      run.push(line);
+    }
+    if (run.length) regions.push(boundingBoxOf(run, pageWidth, pageHeight));
+  }
+  return regions;
 }
 
 function median(nums) {
