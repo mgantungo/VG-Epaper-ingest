@@ -1,9 +1,20 @@
+/**
+ * File:      /var/www/VGEpaper/apps/ingest/src/pipeline/runIngest.js
+ * Repo path: apps/ingest/src/pipeline/runIngest.js
+ * System:    apps/ingest (Express, port 4158)          MODIFIED
+ *
+ * Changes: re-ingest reuses each existing Page and replaces only its auto
+ * stories (manual stories survive); each Page stores the extraction ledger;
+ * pages that keep manual stories are reconciled (covered auto stories dropped).
+ */
 import 'dotenv/config';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
-  getEdition, getPublicationSections, getSkipExtractionSections, downloadSourcePdf, uploadImage, createPage, createStory, updateEditionStatus
+  getEdition, getPublicationSections, getSkipExtractionSections, downloadSourcePdf, uploadImage, createPage, createStory, updateEditionStatus,
+  findPageForEdition, updatePage, listPageStories, deleteStory
 } from './strapiClient.js';
+import { reconcilePage } from './storyEditor.js';
 import { convertPdfToImages } from './convertPdfToImages.js';
 import { extractSections, DEFAULT_PUBLICATION_SECTIONS } from './extractSections.js';
 
@@ -75,13 +86,29 @@ export async function runIngest(editionDocumentId) {
         const section = pageResult?.section || null;
 
         const imageId = await uploadImage(imagePaths[i], fileName);
-        const page = await createPage({ editionDocumentId, editionSku, pageNumber, section, imageId });
+        const ledger = pageResult?.ledger || null;
+        const extraction = { extractionStatus: ledger?.status || 'needs_review', extractionLedger: ledger };
 
+        // Re-ingest: reuse this page number's existing Page, delete only its
+        // auto-detected stories, keep everything an editor made by hand.
+        let page = await findPageForEdition(editionDocumentId, pageNumber);
+        let keptManual = 0;
+        if (page) {
+          page = await updatePage(page.documentId, { editionSku, section, image: imageId, ...extraction });
+          for (const s of await listPageStories(page.documentId)) {
+            if (s.source === 'manual') { keptManual += 1; continue; }
+            await deleteStory(s.documentId);
+          }
+        } else {
+          page = await createPage({ editionDocumentId, editionSku, pageNumber, section, imageId, ...extraction });
+        }
+
+        let pageStoriesMissing = 0;
         const candidates = pageResult?.candidates || [];
         for (const c of candidates) {
           // Skip near-empty/low-signal detections rather than cluttering the
           // review queue — tune this threshold against your real layouts.
-          if (!c.headline || c.headline.trim().length < 4) continue;
+          if (!c.headline || c.headline.trim().length < 4) { pageStoriesMissing += 1; continue; }
 
           // Defensive truncation, not a substitute for fixing extraction
           // quality — Strapi's default string type caps at 255 characters,
@@ -101,6 +128,7 @@ export async function runIngest(editionDocumentId) {
               editionSku,
               box: c.box,
               regions: c.regions,
+              layout: c.layout,
               kicker: c.kicker,
               headline,
               byline: c.byline,
@@ -119,7 +147,21 @@ export async function runIngest(editionDocumentId) {
             // on to the next candidate — that page simply ends up with one
             // fewer published hotspot, not a failed edition.
             console.error(`[runIngest] failed to create story on page ${pageNumber} ("${headline.slice(0, 60)}..."):`, err.message);
+            pageStoriesMissing += 1;
           }
+        }
+
+        // The extraction ledger assumed every candidate became a story; if
+        // one was skipped or rejected, the page is not complete after all.
+        if (pageStoriesMissing && extraction.extractionStatus === 'complete') {
+          await updatePage(page.documentId, { extractionStatus: 'needs_review' })
+            .catch(err => console.warn(`[runIngest] could not flag page ${pageNumber} for review:`, err.message));
+        }
+        // Manual stories kept from an earlier ingest: drop auto stories they
+        // already cover and recompute the ledger against the real story set.
+        if (keptManual) {
+          await reconcilePage(editionDocumentId, pageNumber)
+            .catch(err => console.warn(`[runIngest] reconcile page ${pageNumber}:`, err.message));
         }
       } catch (err) {
         // Same reasoning one level up: a failure in uploadImage/createPage

@@ -1,6 +1,14 @@
+/**
+ * File:      /var/www/VGEpaper/apps/ingest/src/server.js
+ * Repo path: apps/ingest/src/server.js
+ * System:    apps/ingest (Express, port 4158)          MODIFIED
+ *
+ * Change: mounts the story editor router (routes/storyEditor.js).
+ */
 import 'dotenv/config';
 import express from 'express';
 import { runIngest } from './pipeline/runIngest.js';
+import { storyEditorRouter } from './routes/storyEditor.js';
 
 const app = express();
 app.use(express.json());
@@ -39,6 +47,9 @@ app.get('/ingest/edition/:id/status', (req, res) => {
   if (!status) return res.status(404).json({ error: 'no run recorded for this edition (yet, or ever)' });
   res.json(status);
 });
+
+// Manual story editor (handle app -> middleware -> here). Same x-ingest-secret as the webhook above.
+app.use(storyEditorRouter);
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 

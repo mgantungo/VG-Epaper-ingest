@@ -1,3 +1,12 @@
+/**
+ * File:      /var/www/VGEpaper/apps/ingest/src/pipeline/strapiClient.js
+ * Repo path: apps/ingest/src/pipeline/strapiClient.js
+ * System:    apps/ingest (Express, port 4158)          MODIFIED
+ *
+ * Changes: createPage/updatePage carry extractionStatus + extractionLedger;
+ * createStory stores layout + reviewState; new findPageForEdition,
+ * listPageStories, deleteStory for re-ingest that keeps manual stories.
+ */
 import fetch from 'node-fetch';
 import FormData from 'form-data';
 import fs from 'node:fs';
@@ -139,17 +148,61 @@ export async function uploadImage(filePath, fileName) {
  * matched the canonical list, so this is a direct pass-through, not a
  * separate validation step.
  */
-export async function createPage({ editionDocumentId, editionSku, pageNumber, section, imageId }) {
+export async function createPage({ editionDocumentId, editionSku, pageNumber, section, imageId, extractionStatus = null, extractionLedger = null }) {
   const res = await fetch(`${STRAPI_URL}/api/pages`, {
     method: 'POST',
     headers: authHeaders({ 'content-type': 'application/json' }),
     body: JSON.stringify({
-      data: { edition: editionDocumentId, editionSku, pageNumber, section, image: imageId }
+      data: { edition: editionDocumentId, editionSku, pageNumber, section, image: imageId, extractionStatus, extractionLedger }
     })
   });
   if (!res.ok) throw new Error(`createPage ${pageNumber} failed: ${res.status} ${await res.text()}`);
   const json = await res.json();
   return json.data; // { documentId, pageNumber, ... }
+}
+
+/**
+ * The existing Page for (edition, pageNumber), newest first, or null.
+ * Re-ingest reuses it instead of creating a second copy of every page —
+ * duplicates would leave readers and editors looking at different pages.
+ * Page has draftAndPublish off, so no status param is needed.
+ */
+export async function findPageForEdition(editionDocumentId, pageNumber) {
+  const res = await fetch(
+    `${STRAPI_URL}/api/pages?filters[edition][documentId][$eq]=${encodeURIComponent(editionDocumentId)}` +
+    `&filters[pageNumber][$eq]=${Number(pageNumber)}&sort=createdAt:desc&pagination[pageSize]=1`,
+    { headers: authHeaders() }
+  );
+  if (!res.ok) throw new Error(`findPageForEdition ${pageNumber} failed: ${res.status} ${await res.text()}`);
+  return (await res.json()).data?.[0] || null;
+}
+
+/** Update an existing Page (by documentId). */
+export async function updatePage(pageDocumentId, data) {
+  const res = await fetch(`${STRAPI_URL}/api/pages/${pageDocumentId}`, {
+    method: 'PUT',
+    headers: authHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ data })
+  });
+  if (!res.ok) throw new Error(`updatePage ${pageDocumentId} failed: ${res.status} ${await res.text()}`);
+  return (await res.json()).data;
+}
+
+/** Every story on a page: documentId, source and reviewState only. */
+export async function listPageStories(pageDocumentId) {
+  const res = await fetch(
+    `${STRAPI_URL}/api/stories?filters[page][documentId][$eq]=${encodeURIComponent(pageDocumentId)}` +
+    `&fields[0]=source&fields[1]=reviewState&pagination[pageSize]=200`,
+    { headers: authHeaders() }
+  );
+  if (!res.ok) throw new Error(`listPageStories ${pageDocumentId} failed: ${res.status} ${await res.text()}`);
+  return (await res.json()).data || [];
+}
+
+/** Delete a story document (all versions). */
+export async function deleteStory(storyDocumentId) {
+  const res = await fetch(`${STRAPI_URL}/api/stories/${storyDocumentId}`, { method: 'DELETE', headers: authHeaders() });
+  if (!res.ok && res.status !== 404) throw new Error(`deleteStory ${storyDocumentId} failed: ${res.status} ${await res.text()}`);
 }
 
 /**
@@ -174,7 +227,7 @@ export async function createPage({ editionDocumentId, editionSku, pageNumber, se
  * comments for why an absent marker is left null rather than guessed.
  */
 export async function createStory({
-  pageDocumentId, editionSku, box, regions, kicker, headline, byline, teaser, body,
+  pageDocumentId, editionSku, box, regions, layout = null, kicker, headline, byline, teaser, body,
   detectionConfidence, continuesToPage, continuesFromPage
 }) {
   const res = await fetch(`${STRAPI_URL}/api/stories?status=published`, {
@@ -189,6 +242,8 @@ export async function createStory({
         width: box.width,
         height: box.height,
         regions,
+        layout,
+        reviewState: 'active',
         kicker,
         headline,
         byline,
