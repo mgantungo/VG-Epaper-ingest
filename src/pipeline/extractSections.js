@@ -333,7 +333,7 @@ function analyzeRegion(ctx, ws, region) {
 function buildCandidate(ctx, { head, segs, region, kind }) {
   const { W, H, bodyH } = ctx;
   const ordered = orderSegments(segs);
-  const lines = ordered.flatMap(s => s.lines.map((l, i) => ({ ...l, segStart: i === 0, segX0: s.x0 })));
+  const lines = segmentLines(ordered);
 
   let byline = null;
   const bi = lines.slice(0, 3).findIndex(l => looksLikeByline(l.text));
@@ -423,7 +423,7 @@ export function compileFromLayout(layout, regionsPct, { taken = null } = {}) {
   const kicker = firstBig > 0 ? titleLines.slice(0, firstBig).map(l => l.text).join(' ').trim() : null;
   const headline = titleLines.slice(Math.max(firstBig, 0)).map(l => l.text).join(' ').trim() || null;
 
-  const lines = segs.flatMap(s => s.lines.map((l, i) => ({ ...l, segStart: i === 0, segX0: s.x0 })));
+  const lines = segmentLines(segs);
   let byline = null;
   const bi = lines.slice(0, 3).findIndex(l => looksLikeByline(l.text));
   if (bi >= 0) { byline = lines[bi].text.replace(/^by\s+/i, '').trim(); lines.splice(bi, 1); }
@@ -641,18 +641,51 @@ function clusterAdjacent(segs, bodyH) {
 // Text assembly
 // ===========================================================================
 
+// Flatten ordered segments into lines, each carrying its segment's text
+// margins and line pitch so assembleText can spot paragraph breaks.
+// Margins are taken from the bulk of the lines (quartiles), not the extremes,
+// so one jutting or indented line doesn't shift the whole column.
+function segmentLines(segs) {
+  return segs.flatMap(s => {
+    const ls = s.lines;
+    const x0s = ls.map(l => l.x0).sort((a, b) => a - b);
+    const x1s = ls.map(l => l.x1).sort((a, b) => a - b);
+    const left = x0s[Math.floor((x0s.length - 1) * 0.25)] ?? s.x0;
+    const right = x1s[Math.ceil((x1s.length - 1) * 0.75)] ?? s.x1;
+    const pitch = median(ls.slice(1).map((l, i) => l.y0 - ls[i].y0).filter(d => d > 0));
+    return ls.map((l, i) => ({ ...l, segStart: i === 0, segX0: s.x0, segLeft: left, segRight: right, segPitch: pitch }));
+  });
+}
+
+const PARA_END = /[.!?:"”’)…]$/;
+
+// A new paragraph starts before line `l` when the text so far ends a
+// sentence AND any of: the line is indented, the previous line stops well
+// short of the column's right edge, or there is extra space above the line.
+function startsParagraph(l, prev, bodyH, out) {
+  if (!prev || !PARA_END.test(out)) return false;
+  const width = (l.segRight ?? l.x1) - (l.segLeft ?? l.x0);
+  const indent = l.x0 - (l.segLeft ?? l.segX0 ?? l.x0);
+  if (indent > bodyH * 0.45 && indent < width * 0.4) return true;
+  if (prev.x1 < (prev.segRight ?? prev.x1) - bodyH * 2) return true;
+  if (!l.segStart && l.segPitch && l.y0 - prev.y0 > l.segPitch * 1.4) return true;
+  return false;
+}
+
 function assembleText(lines, ctx) {
   const { bodyH, counts } = ctx;
   let out = '';
+  let prev = null;
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     const t = l.text.trim();
     if (!t) continue;
     const sub = isSubhead(t);
-    const indented = l.x0 > (l.segX0 ?? l.x0) + bodyH * 0.8;
-    const prevSub = i > 0 && isSubhead(lines[i - 1].text.trim());
+    const prevSub = prev ? isSubhead(prev.text.trim()) : false;
+    const p = prev;
+    prev = l;
     if (!out) { out = t; continue; }
-    if (sub || prevSub || (indented && /[.!?"”’)]$/.test(out))) { out += `\n\n${t}`; continue; }
+    if (sub || prevSub || startsParagraph(l, p, bodyH, out)) { out += `\n\n${t}`; continue; }
     if (/[A-Za-z]-$/.test(out) && /^[a-z]/.test(t)) {
       const tail = out.match(/([A-Za-z]+)-$/)[1];
       const head = t.match(/^[a-z]+/)[0];
