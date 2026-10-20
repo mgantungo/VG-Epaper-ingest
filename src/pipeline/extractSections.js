@@ -521,9 +521,24 @@ function groupWordsIntoLines(words, keyFn) {
   for (const l of lines) {
     l.words.sort((a, b) => a.x0 - b.x0);
     l.x0 = l.words[0].x0;
-    l.text = l.words.map(w => w.text).join(' ');
+    l.text = joinLineWords(l.words);
   }
   return lines.sort((a, b) => a.y0 - b.y0 || a.x0 - b.x0);
+}
+
+// pdftotext splits a word after an "fi"/"fl"/"ff" ligature glyph
+// ("refi" + "neries"); glue those back when the gap is far tighter than a space.
+const LIGATURE_TAIL = /(ff|fi|fl|ffi|ffl)$/i;
+function joinLineWords(words) {
+  let text = '';
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (!i) { text = w.text; continue; }
+    const p = words[i - 1];
+    const tight = w.x0 - p.x1 < Math.min(p.h, w.h) * 0.15;
+    text += (tight && LIGATURE_TAIL.test(p.text) && /^[a-z]/.test(w.text)) ? w.text : ` ${w.text}`;
+  }
+  return text;
 }
 
 // Stacked heading rows ("DPF TO BOLSTER" / "UGANDA'S FINANCIAL" / "SAFETY NET")
