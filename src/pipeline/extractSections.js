@@ -693,6 +693,7 @@ function assembleText(lines, ctx) {
       out = (counts.get(joined) || 0) >= 1 ? out.slice(0, -1) + t : out + t;
       continue;
     }
+    if (/[A-Za-z]-$/.test(out) && /^[A-Z]/.test(t)) { out += t; continue; } // Anti-|Corruption keeps its hyphen
     out += ` ${t}`;
   }
   return out.replace(/[ \t]+/g, ' ').trim();
